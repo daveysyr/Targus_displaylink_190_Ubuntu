@@ -1,101 +1,105 @@
-# Targus_displaylink_190_Ubuntu
-Installing a Targus Displylink 190 USB-C on Ubuntu
 
 
-DisplayLink Installation on Ubuntu 24.10 (Manual Build)
+# DisplayLink + EVDI + DKMS + Secure Boot Setup (Ubuntu)
 
-This guide walks through building and installing DisplayLink driver v6.0.0 on Ubuntu 24.10 with kernel 6.x using the EVDI module from source.
+This guide documents how to install the DisplayLink driver with EVDI support on Ubuntu with Secure Boot enabled and persistent support across kernel updates via DKMS.
 
-Prerequisites
+Tested on:  
+- **Ubuntu 24.04+**
+- **Kernel:** `6.11.0-24-generic`
+- **DisplayLink Driver:** 6.0.0-24  
+- **EVDI version:** 1.14.1
 
+---
+
+## ⚙️ Prerequisites
+
+```bash
 sudo apt update
-sudo apt install dkms libdrm-dev libpciaccess-dev linux-headers-$(uname -r) build-essential
+sudo apt install dkms make gcc linux-headers-$(uname -r) openssl mokutil
 
-Step 1: Extract and Build
+📦 Extract DisplayLink Package
 
 cd ~/Downloads
 chmod +x displaylink-driver-6.0.0-24.run
-./displaylink-driver-6.0.0-24.run --keep --noexec
+./displaylink-driver-6.0.0-24.run --noexec --target DisplayLinkExtracted
+
+📁 Build and Install EVDI
+
 cd DisplayLinkExtracted
-tar -xzf evdi.tar.gz
-cd evdi
-make KVER=$(uname -r)
+tar -xf evdi.tar.gz
+sudo cp -r evdi /usr/src/evdi-1.14.1
 
-Step 2: Install Kernel Module and Library
+📝 Create /usr/src/evdi-1.14.1/dkms.conf
 
-sudo mkdir -p /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/evdi
-sudo cp module/evdi.ko /lib/modules/$(uname -r)/kernel/drivers/gpu/drm/evdi/
-sudo depmod
-sudo modprobe evdi initial_device_count=1
+PACKAGE_NAME="evdi"
+PACKAGE_VERSION="1.14.1"
+BUILT_MODULE_NAME[0]="evdi"
+BUILT_MODULE_LOCATION[0]="module"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/gpu/drm/evdi"
+MAKE[0]="make -C module KVER=${kernelver} DKMS_BUILD=1"
+CLEAN="make -C module clean"
+AUTOINSTALL="yes"
 
-sudo cp library/libevdi.so.1.14.9 /usr/lib/libevdi.so.1
-sudo ln -sf /usr/lib/libevdi.so.1 /usr/lib/libevdi.so
+🛠 Modify Makefile at /usr/src/evdi-1.14.1/module/
 
-Step 3: Configure Module and Udev Rules
+Ensure this block exists (or override the whole Makefile):
 
-echo "options evdi initial_device_count=1" | sudo tee /etc/modprobe.d/evdi.conf
+obj-m := evdi.o
+evdi-objs := evdi_platform_drv.o evdi_platform_dev.o evdi_sysfs.o evdi_modeset.o \
+             evdi_connector.o evdi_encoder.o evdi_drm_drv.o evdi_fb.o evdi_gem.o \
+             evdi_painter.o evdi_params.o evdi_cursor.o evdi_debug.o evdi_i2c.o \
+             evdi_ioc32.o
 
-echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="17e9", ATTR{idProduct}=="6008", RUN+="/sbin/modprobe evdi"' \
-  | sudo tee /etc/udev/rules.d/99-evdi.rules
+all:
+	$(MAKE) -C /lib/modules/$(KERNELRELEASE)/build M=$(PWD) modules
 
-Step 4: Preload evdi on Boot
+clean:
+	$(MAKE) -C /lib/modules/$(KERNELRELEASE)/build M=$(PWD) clean
 
-sudo tee /etc/systemd/system/evdi-init.service > /dev/null << 'EOF'
-[Unit]
-Description=Load EVDI Kernel Module
-After=systemd-modules-load.service
+🔐 Sign Kernel Module for Secure Boot
 
-[Service]
-Type=oneshot
-ExecStart=/sbin/modprobe evdi
+mkdir -p ~/kernel-signing && cd ~/kernel-signing
+openssl req -new -x509 -newkey rsa:2048 -keyout MOK.key -out MOK.crt -nodes -days 36500 -subj "/CN=Module Signer/"
+openssl x509 -outform DER -in MOK.crt -out MOK.der
+sudo mokutil --import MOK.der
 
-[Install]
-WantedBy=multi-user.target
-EOF
+📌 Reboot and enrol the key via the blue MOK manager screen.
+🧩 Build + Install with DKMS
 
-sudo systemctl daemon-reload
-sudo systemctl enable evdi-init.service
+sudo dkms add -m evdi -v 1.14.1
+sudo dkms build -m evdi -v 1.14.1
+sudo dkms install -m evdi -v 1.14.1
 
-Step 5: Install DisplayLink Files
+You should see:
 
-cd ~/Downloads/DisplayLinkExtracted
-sudo mkdir -p /usr/lib/displaylink
-sudo cp -r x64-ubuntu-1604/* /usr/lib/displaylink/
-sudo cp displaylink-installer.sh /usr/lib/displaylink/
-sudo cp service-installer.sh /usr/lib/displaylink/
-sudo cp udev-installer.sh /usr/lib/displaylink/
+evdi.ko:
+  Running module version sanity check.
+  Original module
+  No changes.
+  Signing module /lib/modules/.../evdi.ko
 
-Step 6: Create Systemd Service
+📡 Enable DisplayLink Driver
 
-sudo tee /usr/lib/systemd/system/displaylink-driver.service > /dev/null << 'EOF'
-[Unit]
-Description=DisplayLink Driver Service
-After=graphical.target evdi-init.service
-
-[Service]
-ExecStart=/usr/lib/displaylink/DisplayLinkManager
-Restart=always
-StandardOutput=null
-
-[Install]
-WantedBy=graphical.target
-EOF
-
-sudo systemctl daemon-reload
 sudo systemctl enable displaylink-driver.service
+sudo systemctl start displaylink-driver.service
 
-Step 7: Finalise and Reboot
+✅ Verify
 
-sudo update-initramfs -u
-sudo reboot
-
-Troubleshooting
-
-If the second screen doesn't appear after reboot:
-
-sudo systemctl restart displaylink-driver.service
-
-Then check display status:
-
+lsmod | grep evdi
 xrandr
 
+You should see evdi loaded and your DisplayLink screen connected (DVI-I-1 or similar).
+🔁 Persistence Across Kernel Updates
+
+Because of DKMS and the signing setup, the EVDI module will now:
+
+    Automatically rebuild for new kernels
+
+    Be signed with your enrolled MOK key
+
+    Load at boot with Secure Boot enabled
+
+🔄 Optional: Reset DKMS
+
+sudo dkms remove -m evdi -v 1.14.1 --all
